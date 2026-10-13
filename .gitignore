@@ -1,0 +1,4 @@
+01-secrets.yaml
+__pycache__/
+.venv/
+.docker-config/

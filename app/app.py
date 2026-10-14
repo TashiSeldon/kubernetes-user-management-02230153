@@ -1,5 +1,6 @@
 import os
 import time
+from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -13,18 +14,40 @@ DB = {
     "dbname": os.environ["DB_NAME"],
     "user": os.environ["DB_USER"],
     "password": os.environ["DB_PASSWORD"],
-    "connect_timeout": 3,
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "2")),
 }
+DB_CONNECT_ATTEMPTS = max(1, int(os.getenv("DB_CONNECT_ATTEMPTS", "2")))
 
 
-def connect():
-    return psycopg2.connect(**DB, cursor_factory=RealDictCursor)
+def connect(*, attempts=None):
+    """Open a connection, retrying only the connection step."""
+    attempts = DB_CONNECT_ATTEMPTS if attempts is None else max(1, attempts)
+    for attempt in range(attempts):
+        try:
+            return psycopg2.connect(**DB, cursor_factory=RealDictCursor)
+        except psycopg2.OperationalError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(0.2)
+
+
+@contextmanager
+def database_connection(*, attempts=None):
+    """Finish the transaction and always close the database socket."""
+    conn = connect(attempts=attempts)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def initialize_database():
+    # Each attempt has a two-second connection timeout. Thirty attempts with
+    # one-second backoff keep startup bounded while tolerating a brief outage.
     for attempt in range(30):
         try:
-            with connect() as conn, conn.cursor() as cur:
+            with database_connection(attempts=1) as conn, conn.cursor() as cur:
                 cur.execute("""CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -34,7 +57,7 @@ def initialize_database():
         except psycopg2.OperationalError:
             if attempt == 29:
                 raise
-            time.sleep(2)
+            time.sleep(1)
 
 
 initialize_database()
@@ -48,16 +71,24 @@ def healthz():
 @app.get("/ready")
 def ready():
     try:
-        with connect() as conn, conn.cursor() as cur:
+        # Readiness checks fail promptly when PostgreSQL is unavailable.
+        with database_connection(attempts=1) as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
         return jsonify(status="ready"), 200
-    except psycopg2.Error:
+    except psycopg2.Error as error:
+        app.logger.warning("Readiness check failed: %s", error)
         return jsonify(error="database unavailable"), 503
+
+
+@app.errorhandler(psycopg2.OperationalError)
+def database_unavailable(error):
+    app.logger.exception("Database operation failed")
+    return jsonify(error="database unavailable"), 503
 
 
 @app.get("/users")
 def list_users():
-    with connect() as conn, conn.cursor() as cur:
+    with database_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT id, name, email FROM users ORDER BY id")
         return jsonify(cur.fetchall())
 
@@ -68,7 +99,7 @@ def create_user():
     if not body.get("name") or not body.get("email"):
         return jsonify(error="name and email are required"), 400
     try:
-        with connect() as conn, conn.cursor() as cur:
+        with database_connection() as conn, conn.cursor() as cur:
             cur.execute("INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id, name, email",
                         (body["name"], body["email"]))
             created = cur.fetchone()
@@ -79,7 +110,7 @@ def create_user():
 
 @app.get("/users/<int:user_id>")
 def get_user(user_id):
-    with connect() as conn, conn.cursor() as cur:
+    with database_connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT id, name, email FROM users WHERE id = %s", (user_id,))
         user = cur.fetchone()
     return (jsonify(user), 200) if user else (jsonify(error="user not found"), 404)
@@ -91,7 +122,7 @@ def update_user(user_id):
     if not body.get("name") or not body.get("email"):
         return jsonify(error="name and email are required"), 400
     try:
-        with connect() as conn, conn.cursor() as cur:
+        with database_connection() as conn, conn.cursor() as cur:
             cur.execute("UPDATE users SET name = %s, email = %s WHERE id = %s RETURNING id, name, email",
                         (body["name"], body["email"], user_id))
             user = cur.fetchone()
@@ -102,7 +133,7 @@ def update_user(user_id):
 
 @app.delete("/users/<int:user_id>")
 def delete_user(user_id):
-    with connect() as conn, conn.cursor() as cur:
+    with database_connection() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM users WHERE id = %s RETURNING id", (user_id,))
         deleted = cur.fetchone()
     return ("", 204) if deleted else (jsonify(error="user not found"), 404)

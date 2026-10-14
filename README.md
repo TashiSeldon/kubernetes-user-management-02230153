@@ -13,7 +13,7 @@ git clone https://github.com/TashiSeldon/kubernetes-user-management-02230153.git
 Set-Location .\kubernetes-user-management-02230153
 ```
 
-The repository is private unless its owner changes visibility or grants the assessor access.
+The repository is public, so the assessor can access it at the link above.
 
 ## Prerequisites and platform
 
